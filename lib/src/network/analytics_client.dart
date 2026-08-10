@@ -6,7 +6,7 @@ class AnalyticsClient {
   final String baseUrl;
   final String apiKey;
 
-  http.Client _http;
+  final http.Client _http;
 
   AnalyticsClient({
     required this.baseUrl,

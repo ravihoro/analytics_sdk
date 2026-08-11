@@ -105,16 +105,18 @@ class Analytics {
 
     try {
       while (true) {
-        final batch = await _queue!.dequeue(_config!.batchSize);
-
-        if (batch.isEmpty) break;
+        final queued = await _queue!.peek(_config!.batchSize);
+        if (queued.isEmpty) break;
 
         try {
-          await _client!.upload(batch);
-          _log('uploaded ${batch.length} event(s)');
+          await _client!.upload(queued.map((q) => q.event).toList());
+
+          await _queue!.acknowledge(queued.map((q) => q.rowId).toList());
+
+          _log('uploaded ${queued.length} event(s)');
         } catch (e, st) {
-          await _queue!.requeue(batch);
-          _log('upload failed, requeued: $e');
+          // Rows stay in SQLite; retry on next flush.
+          _log('upload failed, will retry later: $e');
           if (kDebugMode) {
             debugPrintStack(stackTrace: st);
           }

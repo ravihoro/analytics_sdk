@@ -4,6 +4,7 @@ import 'package:analytics_sdk/analytics_sdk.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
+import 'queued_event.dart';
 
 class EventQueue {
   static const _table = 'analytics_event';
@@ -35,6 +36,32 @@ class EventQueue {
     return EventQueue._(db);
   }
 
+  Future<List<QueuedEvent>> peek(int count) async {
+    final rows = await _db.query(_table, orderBy: 'id ASC', limit: count);
+
+    if (rows.isEmpty) return [];
+
+    return rows
+        .map(
+          (row) => QueuedEvent(
+            event: AnalyticsEvent.fromJson(
+              jsonDecode(row['payload'] as String) as Map<String, dynamic>,
+            ),
+            rowId: row['id'] as int,
+          ),
+        )
+        .toList();
+  }
+
+  Future<void> acknowledge(List<int> rowIds) async {
+    if (rowIds.isEmpty) return;
+
+    await _db.delete(
+      _table,
+      where: 'id IN (${List.filled(rowIds.length, '?').join(',')})',
+    );
+  }
+
   Future<void> enqueue(AnalyticsEvent event) async {
     await _db.insert(_table, {
       'event_id': event.eventId,
@@ -49,48 +76,6 @@ class EventQueue {
     final result = await _db.query('SELECT COUNT(*) AS c FROM $_table');
 
     return Sqflite.firstIntValue(result) ?? 0;
-  }
-
-  /// Oldest-first batch for upload
-  Future<List<AnalyticsEvent>> dequeue(int count) async {
-    final rows = await _db.query(_table, orderBy: 'id ASC', limit: count);
-
-    if (rows.isEmpty) return [];
-
-    final events = rows
-        .map(
-          (row) => AnalyticsEvent.fromJson(
-            jsonDecode(row['payload'] as String) as Map<String, dynamic>,
-          ),
-        )
-        .toList();
-
-    final ids = rows.map((r) => r['id'] as int).toList();
-
-    await _db.delete(
-      _table,
-      where: 'id IN (${List.filled(ids.length, '?').join(',')})',
-      whereArgs: ids,
-    );
-
-    return events;
-  }
-
-  /// Restore events if upload failed (keep same eventIds)
-  Future<void> requeue(List<AnalyticsEvent> events) async {
-    final batch = _db.batch();
-
-    for (final event in events) {
-      batch.insert(_table, {
-        'event_id': event.eventId,
-        'payload': jsonEncode(event.toJson()),
-        'created_at': DateTime.now().millisecondsSinceEpoch,
-      }, conflictAlgorithm: ConflictAlgorithm.replace);
-    }
-
-    await batch.commit();
-
-    await _trimIfNeeded();
   }
 
   Future<void> _trimIfNeeded() async {

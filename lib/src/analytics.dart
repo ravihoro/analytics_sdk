@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:developer';
 import 'dart:io' show Platform;
+import 'package:analytics_sdk/src/queue/queued_event.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -31,21 +33,32 @@ class Analytics {
   Future<void> _init(AnalyticsConfig config) async {
     if (_config != null) return;
 
-    final prefs = await SharedPreferences.getInstance();
-
-    _config = config;
-    _identity = IdentityStore(prefs);
-    _session = SessionManager(prefs);
-    _queue = await EventQueue.create();
-    _client = AnalyticsClient(baseUrl: config.baseUrl, apiKey: config.apiKey);
-
-    _flushTimer = Timer.periodic(config.flushInterval, (_) {
-      unawaited(flush());
-    });
-
-    await flush();
-
-    _log('initialized');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final queue = await EventQueue.create();
+      _config = config;
+      _identity = IdentityStore(prefs);
+      _session = SessionManager(prefs);
+      _queue = queue;
+      _client = AnalyticsClient(baseUrl: config.baseUrl, apiKey: config.apiKey);
+      _flushTimer = Timer.periodic(config.flushInterval, (_) {
+        unawaited(flush());
+      });
+      await flush();
+      _log('initialized');
+    } catch (e, st) {
+      _config = null;
+      _identity = null;
+      _session = null;
+      _queue = null;
+      _client = null;
+      _flushTimer?.cancel();
+      _flushTimer = null;
+      debugPrint('[Analytics] init failed: $e');
+      if (kDebugMode) {
+        debugPrintStack(stackTrace: st);
+      }
+    }
   }
 
   static Future<void> identify(String userId) => instance._identify(userId);
@@ -61,19 +74,19 @@ class Analytics {
   static Future<void> flush() => instance._flush();
 
   Future<void> _identify(String userId) async {
-    _ensureInit();
+    if (!_ensureInit()) return;
     await _identity!.identify(userId);
     await _track('identify', {'userId': userId});
   }
 
   Future<void> _reset() async {
-    _ensureInit();
+    if (!_ensureInit()) return;
     await _identity!.reset();
     await _track('reset', null);
   }
 
   Future<void> _track(String name, Map<String, dynamic>? properties) async {
-    _ensureInit();
+    if (!_ensureInit()) return;
     _session!.touch();
 
     final event = AnalyticsEvent(
@@ -87,14 +100,27 @@ class Analytics {
       platform: _platform(),
     );
 
-    await _queue!.enqueue(event);
+    try {
+      await _queue!.enqueue(event);
+      log('queued: $name');
+    } catch (e, st) {
+      log('enqueue failed: $e');
+      if (kDebugMode) {
+        debugPrintStack(stackTrace: st);
+      }
+      return;
+    }
 
-    _log('queued: $name');
-
-    final pending = await _queue!.length();
-
-    if (pending >= _config!.batchSize) {
-      await flush();
+    try {
+      final pending = await _queue!.length();
+      if (pending >= _config!.batchSize) {
+        await flush();
+      }
+    } catch (e, st) {
+      _log('post-enqueue flush check failed: $e');
+      if (kDebugMode) {
+        debugPrintStack(stackTrace: st);
+      }
     }
   }
 
@@ -105,17 +131,30 @@ class Analytics {
 
     try {
       while (true) {
-        final queued = await _queue!.peek(_config!.batchSize);
+        final List<QueuedEvent> queued;
+        try {
+          queued = await _queue!.peek(_config!.batchSize);
+        } catch (e, st) {
+          _log('peek failed: $e');
+          if (kDebugMode) {
+            debugPrintStack(stackTrace: st);
+          }
+          break; // stop this flush; retry later
+        }
         if (queued.isEmpty) break;
-
         try {
           await _client!.upload(queued.map((q) => q.event).toList());
-
-          await _queue!.acknowledge(queued.map((q) => q.rowId).toList());
-
-          _log('uploaded ${queued.length} event(s)');
+          try {
+            await _queue!.acknowledge(queued.map((q) => q.rowId).toList());
+            _log('uploaded ${queued.length} event(s)');
+          } catch (e, st) {
+            _log('acknowledge failed after upload: $e');
+            if (kDebugMode) {
+              debugPrintStack(stackTrace: st);
+            }
+            break;
+          }
         } catch (e, st) {
-          // Rows stay in SQLite; retry on next flush.
           _log('upload failed, will retry later: $e');
           if (kDebugMode) {
             debugPrintStack(stackTrace: st);
@@ -139,10 +178,12 @@ class Analytics {
     return 'unknown';
   }
 
-  void _ensureInit() {
-    if (isInitialized) {
-      throw StateError("Call Analytics.init(...) before using the SDK");
+  bool _ensureInit() {
+    if (!isInitialized) {
+      debugPrint('[Analytics] not initialized; ignoring call');
+      return false;
     }
+    return true;
   }
 
   void _log(String message) {
